@@ -1,0 +1,54 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: action
+name: 'Publish evidence item'
+description: 'Use this action to capture information that serves as evidence of work done by the workflow run, including commit ID and commit message.'
+
+inputs:
+  content:
+    description: Information to capture as an evidence item for the workflow run. The information is captured at the step level for the workflow run.
+    required: true
+  format:
+    description: Used to render the evidence item.
+    default: MARKDOWN
+
+runs:
+  using: composite
+  steps:
+    - id: captureCommitInfo
+      name: Capture Commit Information
+      run: |
+        # Get the commit ID and message
+        COMMIT_ID=$(git rev-parse HEAD)
+        COMMIT_MSG=$(git log -1 --pretty=%B)
+        
+        # Append the commit information to the content input
+        FULL_CONTENT="$CONTENT\n\nCommit ID: $COMMIT_ID\nCommit Message: $COMMIT_MSG"
+        
+        # Export the updated content to be used in the next step
+        echo "FULL_CONTENT=$FULL_CONTENT" >> /tmp/workflow_env_vars
+
+    - id: postWorkflowEvidenceItem
+      name: Post workflow evidence item
+      uses: docker://alpine/curl:latest
+      run: |
+        # Load the updated content with commit info
+        source /tmp/workflow_env_vars
+        
+        # Prepare content to be used in the JSON
+        PREPARED_CONTENT=$(echo "$FULL_CONTENT" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
+        
+        # Make Platform API call to post workflow evidence item
+        response=$(curl --fail-with-body  -X 'POST' "$URL/v1/workflows/artifact" -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' --data-binary '{"stepId": "'"$STEP_ID"'", "evidence": {"value": "'"$PREPARED_CONTENT"'", "format": "'"$FORMAT"'"}}') || command_failed=1
+        
+        # Check curl exit code
+        if [ ${command_failed:-0} -eq 1 ];
+        then
+          echo "Platform API call failed with error: '$response'"
+          exit 1
+        fi
+      env:
+        STEP_ID: ${{ step.id }}
+        CONTENT: ${{ inputs.content }}
+        FORMAT: ${{ inputs.format }}
+        JWT: ${{ cloudbees.api.token }}
+        URL: ${{ cloudbees.api.url }}
