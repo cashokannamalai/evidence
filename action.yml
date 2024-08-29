@@ -1,11 +1,17 @@
 apiVersion: automation.cloudbees.io/v1alpha1
 kind: action
-name: 'Publish evidence item'
-description: 'Use this action to capture information that serves as evidence of work done by the workflow run.'
+name: 'Publish evidence item with SonarQube metrics'
+description: 'Use this action to capture SonarQube metrics (blocker, critical, major, minor) as evidence of work done by the workflow run.'
 
 inputs:
+  sonarUrl:
+    description: The base URL of the SonarQube server.
+    required: true
+  projectKey:
+    description: The SonarQube project key.
+    required: true
   content:
-    description: Information to capture as an evidence item for the workflow run. The information is captured at the step level for the workflow run.
+    description: Additional information to capture as an evidence item for the workflow run.
     required: true
   format:
     description: Used to render the evidence item.
@@ -14,19 +20,43 @@ inputs:
 runs:
   using: composite
   steps:
+    - id: collectSonarQubeMetrics
+      name: Collect SonarQube Metrics
+      uses: docker://alpine/curl:latest
+      run: |
+        # Get SonarQube metrics (blocker, critical, major, minor)
+        response=$(curl --fail-with-body -X 'GET' "$SONAR_URL/api/issues/search?componentKeys=$PROJECT_KEY&severities=BLOCKER,CRITICAL,MAJOR,MINOR" -H 'Content-Type: application/json') || command_failed=1
+
+        if [ ${command_failed:-0} -eq 1 ]; then
+          echo "Failed to retrieve SonarQube metrics: '$response'"
+          exit 1
+        fi
+
+        # Extract the count of each issue type
+        blocker_count=$(echo "$response" | jq '.issues | map(select(.severity == "BLOCKER")) | length')
+        critical_count=$(echo "$response" | jq '.issues | map(select(.severity == "CRITICAL")) | length')
+        major_count=$(echo "$response" | jq '.issues | map(select(.severity == "MAJOR")) | length')
+        minor_count=$(echo "$response" | jq '.issues | map(select(.severity == "MINOR")) | length')
+
+        # Prepare content to be used in the JSON
+        SONAR_METRICS="| Severity | Count |\n|----------|-------|\n| Blocker  | $blocker_count |\n| Critical | $critical_count |\n| Major    | $major_count |\n| Minor    | $minor_count |\n"
+        PREPARED_CONTENT=$(echo "$SONAR_METRICS\n$CONTENT" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
+
+        # Output metrics for subsequent steps
+        echo "BLOCKER_COUNT=$blocker_count" >> $GITHUB_ENV
+        echo "CRITICAL_COUNT=$critical_count" >> $GITHUB_ENV
+        echo "MAJOR_COUNT=$major_count" >> $GITHUB_ENV
+        echo "MINOR_COUNT=$minor_count" >> $GITHUB_ENV
+        
     - id: postWorkflowEvidenceItem
       name: Post workflow evidence item
       uses: docker://alpine/curl:latest
       run: |
-        # Prepare content to be used in the JSON
-        PREPARED_CONTENT=$(echo "$CONTENT" | sed 's/"/\\"/g' | sed 's/$/\\n/g' | tr -d '\n')
-        
         # Make Platform API call to post workflow evidence item
-        response=$(curl --fail-with-body  -X 'POST' "$URL/v1/workflows/artifact" -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' --data-binary '{"stepId": "'"$STEP_ID"'", "evidence": {"value": "'"$PREPARED_CONTENT"'", "format": "'"$FORMAT"'"}}') || command_failed=1
+        response=$(curl --fail-with-body -X 'POST' "$URL/v1/workflows/artifact" -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' --data-binary '{"stepId": "'"$STEP_ID"'", "evidence": {"value": "'"$PREPARED_CONTENT"'", "format": "'"$FORMAT"'"}}') || command_failed=1
         
         # Check curl exit code
-        if [ ${command_failed:-0} -eq 1 ];
-        then
+        if [ ${command_failed:-0} -eq 1 ]; then
           echo "Platform API call failed with error: '$response'"
           exit 1
         fi
@@ -36,3 +66,5 @@ runs:
         FORMAT: ${{ inputs.format }}
         JWT: ${{ cloudbees.api.token }}
         URL: ${{ cloudbees.api.url }}
+        SONAR_URL: ${{ inputs.sonarUrl }}
+        PROJECT_KEY: ${{ inputs.projectKey }}
